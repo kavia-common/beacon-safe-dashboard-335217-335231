@@ -7,6 +7,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from src.api.db import load_db_config, try_connect_once
+
 logger = logging.getLogger("beacon_safe_backend.api")
 
 
@@ -51,6 +53,18 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
+# Optional DB connectivity (Postgres). The app remains functional without DB for this MVP,
+# but we log a one-time diagnostic at startup to ensure the database container wiring is correct.
+_db_cfg = load_db_config()
+if _db_cfg:
+    ok, msg = try_connect_once(_db_cfg)
+    if ok:
+        logger.info("DBConnectivityFlow success")
+    else:
+        logger.warning("DBConnectivityFlow failed detail=%s", msg)
+else:
+    logger.info("DBConnectivityFlow skipped (DATABASE_URL not set)")
+
 
 def _get_allowed_origins() -> List[str]:
     """
@@ -88,19 +102,16 @@ class LoginRequest(BaseModel):
     password: str = Field(..., min_length=1, description="Password (any non-empty value is accepted).")
 
 
-class UserInfo(BaseModel):
-    """Represents the authenticated user details returned to the frontend."""
-
-    username: str = Field(..., description="The user's username.")
-    name: str = Field(..., description="Display name for the user.")
-    email: str = Field(..., description="Email address for the user.")
-
-
 class LoginResponse(BaseModel):
-    """Response payload for mock login."""
+    """Response payload for mock login.
 
+    NOTE: This shape is intentionally flat to match the existing frontend `User` type:
+      { username, email, token }
+    """
+
+    username: str = Field(..., description="Authenticated username (frontend-compatible).")
+    email: str = Field(..., description="User email (frontend-compatible).")
     token: str = Field(..., description="Mock JWT token to be used as Bearer token in Authorization header.")
-    user: UserInfo = Field(..., description="User profile details.")
 
 
 DeviceStatus = Literal["Online", "Offline", "Warning"]
@@ -116,30 +127,24 @@ class Device(BaseModel):
     battery: int = Field(..., ge=0, le=100, description="Battery level percentage (0-100).")
 
 
-class SystemPreferences(BaseModel):
-    """System preferences part of settings."""
-
-    theme: Literal["light", "dark"] = Field("dark", description="UI theme preference.")
-
-
 class Settings(BaseModel):
-    """Settings returned by /settings endpoints."""
+    """Settings returned by /settings endpoints.
 
-    profile: UserInfo = Field(..., description="Profile information.")
-    preferences: SystemPreferences = Field(..., description="System preferences.")
+    NOTE: This shape is intentionally flat to match the existing frontend `ProfileSettings` type:
+      { name, email, theme }
+    """
+
+    name: str = Field(..., description="User display name.")
+    email: str = Field(..., description="User email address.")
+    theme: Literal["light", "dark"] = Field("dark", description="UI theme preference.")
 
 
 class SettingsUpdateRequest(BaseModel):
     """PUT request payload for /settings."""
 
-    profile: Optional[UserInfo] = Field(
-        default=None,
-        description="Optional profile update. If omitted, profile remains unchanged.",
-    )
-    preferences: Optional[SystemPreferences] = Field(
-        default=None,
-        description="Optional preferences update. If omitted, preferences remain unchanged.",
-    )
+    name: Optional[str] = Field(default=None, description="Optional display name update.")
+    email: Optional[str] = Field(default=None, description="Optional email update.")
+    theme: Optional[Literal["light", "dark"]] = Field(default=None, description="Optional theme update.")
 
 
 class AuthContext(BaseModel):
@@ -235,14 +240,11 @@ def _get_or_init_settings_for_user(username: str) -> Settings:
     if username in _SETTINGS_STORE:
         return _SETTINGS_STORE[username]
 
-    # Default profile values derived from username.
+    # Default values derived from username.
     settings = Settings(
-        profile=UserInfo(
-            username=username,
-            name=username.title(),
-            email=f"{username}@beacon-safe.local",
-        ),
-        preferences=SystemPreferences(theme="dark"),
+        name=username.title(),
+        email=f"{username}@beacon-safe.local",
+        theme="dark",
     )
     _SETTINGS_STORE[username] = settings
     return settings
@@ -304,6 +306,22 @@ def health_check() -> Dict[str, str]:
     return {"message": "Healthy"}
 
 
+@app.get(
+    "/db-status",
+    tags=["Health"],
+    summary="Database status",
+    description="Checks whether the API can connect to Postgres using DATABASE_URL. DB is optional for this MVP.",
+    operation_id="db_status",
+)
+def db_status() -> Dict[str, str]:
+    """Return simple DB connectivity status for integration diagnostics."""
+    cfg = load_db_config()
+    if not cfg:
+        return {"status": "skipped", "detail": "DATABASE_URL not set"}
+    ok, msg = try_connect_once(cfg)
+    return {"status": "ok" if ok else "error", "detail": msg}
+
+
 @app.post(
     "/login",
     tags=["Auth"],
@@ -318,19 +336,18 @@ def login(payload: LoginRequest) -> LoginResponse:
 
     Contract:
     - Input: LoginRequest with non-empty username and password
-    - Output: LoginResponse including a mock token and default user profile fields
-    - Errors:
-        - 400 if username/password are empty (validation)
+    - Output: LoginResponse including a mock token and default user fields
     - Side effects:
         - initializes settings store defaults for this user (in-memory)
     """
-    logger.info("LoginFlow start username=%s", payload.username)
+    username = payload.username.strip()
+    logger.info("LoginFlow start username=%s", username)
 
-    token = _issue_mock_jwt(payload.username.strip())
-    settings = _get_or_init_settings_for_user(payload.username.strip())
+    token = _issue_mock_jwt(username)
+    settings = _get_or_init_settings_for_user(username)
 
-    resp = LoginResponse(token=token, user=settings.profile)
-    logger.info("LoginFlow success username=%s", payload.username)
+    resp = LoginResponse(token=token, username=username, email=settings.email)
+    logger.info("LoginFlow success username=%s", username)
     return resp
 
 
@@ -358,6 +375,19 @@ def list_devices(_auth: Annotated[AuthContext, Depends(verify_mock_jwt)]) -> Lis
 
 
 @app.get(
+    "/dashboard",
+    tags=["Devices"],
+    summary="List devices (dashboard alias)",
+    description="Alias endpoint for frontend compatibility. Returns the same payload as /devices.",
+    operation_id="list_devices_dashboard_alias",
+    response_model=List[Device],
+)
+def dashboard_devices(_auth: Annotated[AuthContext, Depends(verify_mock_jwt)]) -> List[Device]:
+    """Alias for list_devices; kept to support the frontend /dashboard call."""
+    return list_devices(_auth)
+
+
+@app.get(
     "/settings",
     tags=["Settings"],
     summary="Get settings",
@@ -376,7 +406,7 @@ def get_settings(_auth: Annotated[AuthContext, Depends(verify_mock_jwt)]) -> Set
     """
     logger.info("SettingsGetFlow start username=%s", _auth.username)
     settings = _get_or_init_settings_for_user(_auth.username)
-    logger.info("SettingsGetFlow success username=%s theme=%s", _auth.username, settings.preferences.theme)
+    logger.info("SettingsGetFlow success username=%s theme=%s", _auth.username, settings.theme)
     return settings
 
 
@@ -384,7 +414,7 @@ def get_settings(_auth: Annotated[AuthContext, Depends(verify_mock_jwt)]) -> Set
     "/settings",
     tags=["Settings"],
     summary="Update settings",
-    description="Updates profile and/or system preferences for the authenticated user (in-memory).",
+    description="Updates name/email/theme for the authenticated user (in-memory).",
     operation_id="update_settings",
     response_model=Settings,
 )
@@ -397,9 +427,7 @@ def update_settings(
 
     Contract:
     - Requires Authorization Bearer token
-    - Input: SettingsUpdateRequest
-        - profile (optional)
-        - preferences (optional)
+    - Input: SettingsUpdateRequest (name/email/theme all optional)
     - Output: updated Settings object
     - Errors: 401 if token missing/invalid
     - Side effects: mutates in-memory settings store
@@ -407,23 +435,16 @@ def update_settings(
     logger.info("SettingsUpdateFlow start username=%s", _auth.username)
     current = _get_or_init_settings_for_user(_auth.username)
 
-    # Apply updates in a simple, explicit manner.
-    updated_profile = payload.profile if payload.profile is not None else current.profile
-    updated_preferences = payload.preferences if payload.preferences is not None else current.preferences
-
-    # Ensure profile.username remains consistent with authenticated user.
-    if updated_profile.username != _auth.username:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="profile.username cannot be changed.",
-        )
-
-    updated = Settings(profile=updated_profile, preferences=updated_preferences)
+    updated = Settings(
+        name=payload.name if payload.name is not None else current.name,
+        email=payload.email if payload.email is not None else current.email,
+        theme=payload.theme if payload.theme is not None else current.theme,
+    )
     _SETTINGS_STORE[_auth.username] = updated
 
     logger.info(
         "SettingsUpdateFlow success username=%s theme=%s",
         _auth.username,
-        updated.preferences.theme,
+        updated.theme,
     )
     return updated
