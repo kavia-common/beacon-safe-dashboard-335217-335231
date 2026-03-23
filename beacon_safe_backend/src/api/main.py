@@ -307,6 +307,18 @@ def health_check() -> Dict[str, str]:
 
 
 @app.get(
+    "/healthz",
+    tags=["Health"],
+    summary="Health check (platform)",
+    description="Health endpoint used by the deployment/preview platform readiness probes.",
+    operation_id="health_check_platform",
+)
+def health_check_platform() -> Dict[str, str]:
+    """Health check endpoint for platform readiness probes (alias of `/`)."""
+    return health_check()
+
+
+@app.get(
     "/db-status",
     tags=["Health"],
     summary="Database status",
